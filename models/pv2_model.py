@@ -46,14 +46,21 @@ def _fit_models():
     X_physics = np.column_stack([df["irradiance"], df["irradiance"] * (df["module_temp"] - 25)])
     y = df["power"].to_numpy()
 
+    # fit_intercept=False: zero irradiance should mean zero power, so no constant term.
     physics_model = LinearRegression(fit_intercept=False).fit(X_physics, y)
 
+    # Gaussian Process kernel: ConstantKernel scales overall variance, RBF gives each feature
+    # its own smoothness ("length scale"), WhiteKernel absorbs measurement noise. The ranges are
+    # search bounds; sklearn fits the exact values to this dataset. n_restarts_optimizer=3 tries
+    # 3 starting points to avoid a poor local optimum; random_state=0 makes results reproducible.
     gp_kernel = ConstantKernel(1.0, (1e-2, 1e3)) * RBF([1.0, 1.0], (1e-2, 1e2)) + WhiteKernel(1.0, (1e-5, 1e2))
     gp_model = make_pipeline(
-        StandardScaler(),
+        StandardScaler(),  # put both features on a comparable numeric scale first
         GaussianProcessRegressor(kernel=gp_kernel, normalize_y=True, n_restarts_optimizer=3, random_state=0),
     ).fit(X, y)
 
+    # Random Forest: averages 300 decision trees, each trained on a random resample of the
+    # data, for a smoother and more stable prediction than any single tree.
     rf_model = RandomForestRegressor(n_estimators=300, random_state=0).fit(X, y)
 
     return physics_model, gp_model, rf_model, x_axis, y_axis, power_grid

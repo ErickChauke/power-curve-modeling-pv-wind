@@ -46,14 +46,30 @@ def _fit_models():
     X_physics = np.column_stack([df["irradiance"], df["irradiance"] * (df["module_temp"] - 25)])
     y = df["power"].to_numpy()
 
+    # fit_intercept=False: the physics formula has no standalone constant term, at zero
+    # irradiance the model should predict exactly zero power, which is physically correct.
     physics_model = LinearRegression(fit_intercept=False).fit(X_physics, y)
 
+    # Gaussian Process (GP): a smooth curve-fitting method whose "kernel" controls how smooth
+    # the fitted surface is. ConstantKernel sets an overall scale for how much power can vary;
+    # RBF sets one length scale per input feature (a short one means power can change quickly
+    # over a small step in that feature, a long one means a gentler surface); WhiteKernel
+    # absorbs measurement noise so the model does not chase every small grid wiggle. The ranges
+    # given are just search bounds, sklearn fits the exact values to this dataset during .fit().
     gp_kernel = ConstantKernel(1.0, (1e-2, 1e3)) * RBF([1.0, 1.0], (1e-2, 1e2)) + WhiteKernel(1.0, (1e-5, 1e2))
     gp_model = make_pipeline(
-        StandardScaler(),
-        GaussianProcessRegressor(kernel=gp_kernel, normalize_y=True, n_restarts_optimizer=3, random_state=0),
+        StandardScaler(),  # put irradiance and temperature on a comparable numeric scale first
+        GaussianProcessRegressor(
+            kernel=gp_kernel,
+            normalize_y=True,        # apply the same rescaling to the power values
+            n_restarts_optimizer=3,  # try 3 starting points when tuning the kernel, to avoid a poor local optimum
+            random_state=0,          # fixed seed, for reproducible results
+        ),
     ).fit(X, y)
 
+    # Random Forest: averages many decision trees, each trained on a random resample of the
+    # data. n_estimators=300 is how many trees to average (more trees are smoother and more
+    # stable, at the cost of compute; 300 comfortably levels off for a dataset this small).
     rf_model = RandomForestRegressor(n_estimators=300, random_state=0).fit(X, y)
 
     return physics_model, gp_model, rf_model, x_axis, y_axis, power_grid

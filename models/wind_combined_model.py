@@ -51,6 +51,11 @@ def _grid_to_df(path, sheet_name, plant, clip=False):
 
 
 def _build_features(velocity, direction_deg, is_wind2):
+    # Wind direction is circular: 15 deg and 360 deg are adjacent bearings, not 345 deg apart.
+    # Encoding it as (sin, cos) instead of raw degrees puts adjacent bearings next to each other
+    # in feature space too, so a distance-based model like GP does not see a false discontinuity
+    # at the wrap-around point. is_wind2 is a one-hot "is this row from Wind2?" feature (0 for
+    # Wind1 rows, 1 for Wind2 rows), how the pooled models are told which plant each row is from.
     direction_rad = np.deg2rad(direction_deg)
     return np.column_stack([velocity, np.sin(direction_rad), np.cos(direction_rad), is_wind2])
 
@@ -64,12 +69,21 @@ def _fit_models():
     X = _build_features(df["wind_velocity"].to_numpy(), df["wind_direction"].to_numpy(), is_wind2.to_numpy())
     y = df["power"].to_numpy()
 
+    # Gaussian Process kernel: ConstantKernel scales overall variance, RBF gives each of the
+    # four features (including is_wind2) its own smoothness ("length scale"), WhiteKernel
+    # absorbs measurement noise. The ranges are search bounds; sklearn fits the exact values
+    # during .fit(). n_restarts_optimizer=3 tries 3 starting points to avoid a poor local
+    # optimum; random_state=0 makes results reproducible.
     gp_kernel = ConstantKernel(1.0, (1e-2, 1e3)) * RBF([1.0, 1.0, 1.0, 1.0], (1e-2, 1e2)) + WhiteKernel(1.0, (1e-5, 1e2))
     gp_model = make_pipeline(
-        StandardScaler(),
+        StandardScaler(),  # put all four features on a comparable numeric scale first
         GaussianProcessRegressor(kernel=gp_kernel, normalize_y=True, n_restarts_optimizer=3, random_state=0),
     ).fit(X, y)
 
+    # Gradient Boosting: builds 300 decision trees one at a time, each correcting the errors
+    # left by the trees before it, rather than averaging independent trees like Random Forest.
+    # This often fits sharp, non-smooth shapes (a wind power curve's steep cut-in transition)
+    # a bit better.
     gbm_model = GradientBoostingRegressor(n_estimators=300, random_state=0).fit(X, y)
 
     return gp_model, gbm_model, x_axis, y_axis, wind1_grid, wind2_grid

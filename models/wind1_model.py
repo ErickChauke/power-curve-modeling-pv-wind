@@ -34,6 +34,10 @@ def _parse_grid_sheet(path, sheet_name):
 
 
 def _build_features(velocity, direction_deg):
+    # Wind direction is circular: 15 deg and 360 deg are adjacent bearings, not 345 deg apart.
+    # Encoding it as (sin, cos) instead of raw degrees puts adjacent bearings next to each other
+    # in feature space too, so a distance-based model like GP does not see a false discontinuity
+    # at the wrap-around point.
     direction_rad = np.deg2rad(direction_deg)
     return np.column_stack([velocity, np.sin(direction_rad), np.cos(direction_rad)])
 
@@ -51,12 +55,21 @@ def _fit_models():
     X = _build_features(df["wind_velocity"].to_numpy(), df["wind_direction"].to_numpy())
     y = df["power"].to_numpy()
 
+    # Gaussian Process kernel: ConstantKernel scales overall variance, RBF gives each of the
+    # three features its own smoothness ("length scale"), WhiteKernel absorbs measurement
+    # noise. The ranges are search bounds; sklearn fits the exact values during .fit().
+    # n_restarts_optimizer=3 tries 3 starting points to avoid a poor local optimum;
+    # random_state=0 makes results reproducible.
     gp_kernel = ConstantKernel(1.0, (1e-2, 1e3)) * RBF([1.0, 1.0, 1.0], (1e-2, 1e2)) + WhiteKernel(1.0, (1e-5, 1e2))
     gp_model = make_pipeline(
-        StandardScaler(),
+        StandardScaler(),  # put all three features on a comparable numeric scale first
         GaussianProcessRegressor(kernel=gp_kernel, normalize_y=True, n_restarts_optimizer=3, random_state=0),
     ).fit(X, y)
 
+    # Gradient Boosting: builds 300 decision trees one at a time, each correcting the errors
+    # left by the trees before it, rather than averaging independent trees like Random Forest.
+    # This often fits sharp, non-smooth shapes (a wind power curve's steep cut-in transition)
+    # a bit better.
     gbm_model = GradientBoostingRegressor(n_estimators=300, random_state=0).fit(X, y)
 
     return gp_model, gbm_model, x_axis, y_axis, power_grid
