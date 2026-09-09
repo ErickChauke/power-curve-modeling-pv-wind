@@ -1,16 +1,24 @@
-"""Standalone Wind1 power curve model: GP and Gradient Boosting.
+"""Standalone Wind1 power curve model: a parametric power curve formula, GP, and Gradient
+Boosting.
 
-No physics formula: the grid is fully dense, so there is no unsampled-region extrapolation
-problem to motivate one (see notebook.ipynb's Wind1 Model section). Refits both models from the
-source grid on import (the dataset is tiny, refitting is instant). Wind direction is circular, so
-it is encoded as (sin, cos) internally rather than fed in as raw degrees. Exposes
-predict(velocity, direction, model="gp") plus per-model predict_gp / predict_gbm functions.
+No PV-style physics formula: the grid is fully dense, so there is no unsampled-region
+extrapolation problem to motivate one. Instead, "curve" is a classic wind-turbine power curve
+equation (see wind_power_curve below), a real closed-form formula rather than a fit that only
+makes sense next to its training grid, this is the default model since it is the simplest
+genuine answer. GP and GBM remain available for the tighter statistical fit (see
+notebook.ipynb's Wind1 Model section for the full comparison). Refits all three from the source
+grid on import (the dataset is tiny, refitting is instant). Wind direction is circular, so GP/GBM
+encode it as (sin, cos) internally rather than raw degrees; the curve formula ignores direction
+entirely, since velocity dominates power output far more (see the SHAP analysis in
+notebook.ipynb). Exposes predict(velocity, direction, model="curve") plus per-model
+predict_curve / predict_gp / predict_gbm functions.
 """
 
 import pathlib
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import curve_fit
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
@@ -42,6 +50,28 @@ def _build_features(velocity, direction_deg):
     return np.column_stack([velocity, np.sin(direction_rad), np.cos(direction_rad)])
 
 
+def wind_power_curve(v, v_cutin, v_rated, p_rated, k):
+    """Piecewise cubic-style wind turbine power curve [2]: 0 below cut-in, p_rated above rated
+    speed, and a v^k ramp in between."""
+    v = np.asarray(v, dtype=float)
+    power = np.zeros_like(v)
+    ramp = (v >= v_cutin) & (v < v_rated)
+    power[ramp] = p_rated * (v[ramp]**k - v_cutin**k) / (v_rated**k - v_cutin**k)
+    power[v >= v_rated] = p_rated
+    return power
+
+
+def _fit_curve(velocity, power, capacity_mw):
+    # Initial guess and search bounds: cut-in near 3 m/s, rated near 12 m/s, rated power near
+    # nameplate capacity, shape exponent between linear (1) and the idealized cubic (up to 10).
+    params, _ = curve_fit(
+        wind_power_curve, velocity, power,
+        p0=[3.0, 12.0, capacity_mw, 3.0],
+        bounds=([0.0, 5.0, capacity_mw * 0.8, 1.0], [8.0, 20.0, capacity_mw * 1.2, 10.0]),
+    )
+    return params
+
+
 def _fit_models():
     x_axis, y_axis, power_grid = _parse_grid_sheet(DATA_PATH, "Wind1")
 
@@ -54,6 +84,8 @@ def _fit_models():
 
     X = _build_features(df["wind_velocity"].to_numpy(), df["wind_direction"].to_numpy())
     y = df["power"].to_numpy()
+
+    curve_params = _fit_curve(df["wind_velocity"].to_numpy(), y, CAPACITY_MW)
 
     # Gaussian Process kernel: ConstantKernel scales overall variance, RBF gives each of the
     # three features its own smoothness ("length scale"), WhiteKernel absorbs measurement
@@ -72,16 +104,23 @@ def _fit_models():
     # a bit better.
     gbm_model = GradientBoostingRegressor(n_estimators=300, random_state=0).fit(X, y)
 
-    return gp_model, gbm_model, x_axis, y_axis, power_grid
+    return curve_params, gp_model, gbm_model, x_axis, y_axis, power_grid
 
 
-GP_MODEL, GBM_MODEL, X_AXIS, Y_AXIS, POWER_GRID = _fit_models()
+CURVE_PARAMS, GP_MODEL, GBM_MODEL, X_AXIS, Y_AXIS, POWER_GRID = _fit_models()
 
 
 def _predict_generic(model, velocity, direction):
     V, D = np.broadcast_arrays(np.asarray(velocity, dtype=float), np.asarray(direction, dtype=float))
     X = _build_features(V.ravel(), D.ravel())
     pred = model.predict(X).reshape(V.shape)
+    return float(pred) if pred.shape == () else pred
+
+
+def predict_curve(velocity, direction=None):
+    # direction is accepted (and ignored) so this has the same call signature as predict_gp/gbm.
+    V = np.asarray(velocity, dtype=float)
+    pred = wind_power_curve(V.ravel(), *CURVE_PARAMS).reshape(V.shape)
     return float(pred) if pred.shape == () else pred
 
 
@@ -93,10 +132,12 @@ def predict_gbm(velocity, direction):
     return _predict_generic(GBM_MODEL, velocity, direction)
 
 
-def predict(velocity, direction, model="gp"):
-    dispatch = {"gp": predict_gp, "gbm": predict_gbm}
+def predict(velocity, direction=None, model="curve"):
+    dispatch = {"curve": predict_curve, "gp": predict_gp, "gbm": predict_gbm}
     if model not in dispatch:
         raise ValueError(f"model must be one of {list(dispatch)}, got {model!r}")
+    if model == "curve":
+        return predict_curve(velocity)
     return dispatch[model](velocity, direction)
 
 
@@ -105,18 +146,19 @@ if __name__ == "__main__":
 
     sample_v, sample_dir = 10.0, 180.0
     print(f"Sample prediction at velocity={sample_v} m/s, direction={sample_dir} deg:")
-    for model_name in ["gp", "gbm"]:
+    for model_name in ["curve", "gp", "gbm"]:
         print(f"  {model_name}: {predict(sample_v, sample_dir, model=model_name):.2f} MW")
 
     full_vel_mesh, full_dir_mesh = np.meshgrid(Y_AXIS, X_AXIS, indexing="ij")
     panels = [
         ("Actual", POWER_GRID),
+        ("Curve", predict_curve(full_vel_mesh)),
         ("GP", predict_gp(full_vel_mesh, full_dir_mesh)),
         ("GBM", predict_gbm(full_vel_mesh, full_dir_mesh)),
     ]
     extent = [X_AXIS.min(), X_AXIS.max(), Y_AXIS.min(), Y_AXIS.max()]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
     for ax, (title, grid_) in zip(axes, panels):
         im = ax.imshow(grid_, origin="lower", aspect="auto", extent=extent, vmin=0, vmax=CAPACITY_MW)
         ax.set_title(f"Wind1 {title}")

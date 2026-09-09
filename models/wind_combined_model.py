@@ -1,17 +1,25 @@
-"""Standalone Wind-combined power curve model: GP and Gradient Boosting.
+"""Standalone Wind-combined power curve model: a parametric power curve formula, GP, and
+Gradient Boosting.
 
-Fits on Wind1 and Wind2 pooled together, with plant as a one-hot feature for both models (see
-notebook.ipynb's Wind-combined Model section). Refits both models from the source grid on import
-(the dataset is tiny, refitting is instant). Wind direction is circular, so it is encoded as
-(sin, cos) internally. The documented Wind2 negative-value artifact is clipped to 0 before
-fitting. Exposes predict(velocity, direction, plant, model="gp") plus per-model
-predict_gp / predict_gbm functions.
+GP and GBM fit on Wind1 and Wind2 pooled together, with plant as a one-hot feature (see
+notebook.ipynb's Wind-combined Model section). The "curve" model is different: rated power,
+cut-in speed, and rated speed are physical properties of one specific turbine fleet, there is no
+meaningful "shared" version of them the way a GP kernel or an RF split can be shared with a plant
+flag. So "curve" here is simply each plant's own formula (see wind1_model.py / wind2_model.py),
+refit here for a consistent interface, this is the default model since it is the simplest
+genuine answer for a given plant. Refits all three from the source grid on import (the dataset is
+tiny, refitting is instant). Wind direction is circular, so GP/GBM encode it as (sin, cos)
+internally; the curve formula ignores direction entirely, since velocity dominates power output
+far more (see the SHAP analysis in notebook.ipynb). The documented Wind2 negative-value artifact
+is clipped to 0 before fitting. Exposes predict(velocity, direction, plant, model="curve") plus
+per-model predict_curve / predict_gp / predict_gbm functions.
 """
 
 import pathlib
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import curve_fit
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
@@ -60,10 +68,37 @@ def _build_features(velocity, direction_deg, is_wind2):
     return np.column_stack([velocity, np.sin(direction_rad), np.cos(direction_rad), is_wind2])
 
 
+def wind_power_curve(v, v_cutin, v_rated, p_rated, k):
+    """Piecewise cubic-style wind turbine power curve [2]: 0 below cut-in, p_rated above rated
+    speed, and a v^k ramp in between."""
+    v = np.asarray(v, dtype=float)
+    power = np.zeros_like(v)
+    ramp = (v >= v_cutin) & (v < v_rated)
+    power[ramp] = p_rated * (v[ramp]**k - v_cutin**k) / (v_rated**k - v_cutin**k)
+    power[v >= v_rated] = p_rated
+    return power
+
+
+def _fit_curve(velocity, power, capacity_mw):
+    # Initial guess and search bounds: cut-in near 3 m/s, rated near 12 m/s, rated power near
+    # nameplate capacity, shape exponent between linear (1) and the idealized cubic (up to 10).
+    params, _ = curve_fit(
+        wind_power_curve, velocity, power,
+        p0=[3.0, 12.0, capacity_mw, 3.0],
+        bounds=([0.0, 5.0, capacity_mw * 0.8, 1.0], [8.0, 20.0, capacity_mw * 1.2, 10.0]),
+    )
+    return params
+
+
 def _fit_models():
     wind1_df, x_axis, y_axis, wind1_grid = _grid_to_df(DATA_PATH, "Wind1", "Wind1")
     wind2_df, _, _, wind2_grid = _grid_to_df(DATA_PATH, "Wind2", "Wind2", clip=True)
     df = pd.concat([wind1_df, wind2_df], ignore_index=True)
+
+    curve_params = {
+        "Wind1": _fit_curve(wind1_df["wind_velocity"].to_numpy(), wind1_df["power"].to_numpy(), CAPACITY_MW["Wind1"]),
+        "Wind2": _fit_curve(wind2_df["wind_velocity"].to_numpy(), wind2_df["power"].to_numpy(), CAPACITY_MW["Wind2"]),
+    }
 
     is_wind2 = (df["plant"] == "Wind2").astype(float)
     X = _build_features(df["wind_velocity"].to_numpy(), df["wind_direction"].to_numpy(), is_wind2.to_numpy())
@@ -86,10 +121,10 @@ def _fit_models():
     # a bit better.
     gbm_model = GradientBoostingRegressor(n_estimators=300, random_state=0).fit(X, y)
 
-    return gp_model, gbm_model, x_axis, y_axis, wind1_grid, wind2_grid
+    return curve_params, gp_model, gbm_model, x_axis, y_axis, wind1_grid, wind2_grid
 
 
-GP_MODEL, GBM_MODEL, X_AXIS, Y_AXIS, WIND1_GRID, WIND2_GRID = _fit_models()
+CURVE_PARAMS, GP_MODEL, GBM_MODEL, X_AXIS, Y_AXIS, WIND1_GRID, WIND2_GRID = _fit_models()
 
 
 def _predict_generic(model, velocity, direction, plant):
@@ -97,6 +132,13 @@ def _predict_generic(model, velocity, direction, plant):
     is_wind2 = np.where(np.broadcast_to(np.asarray(plant), V.shape) == "Wind2", 1.0, 0.0)
     X = _build_features(V.ravel(), D.ravel(), is_wind2.ravel())
     pred = model.predict(X).reshape(V.shape)
+    return float(pred) if pred.shape == () else pred
+
+
+def predict_curve(velocity, direction=None, plant="Wind1"):
+    # direction is accepted (and ignored) so this has the same call signature as predict_gp/gbm.
+    V = np.asarray(velocity, dtype=float)
+    pred = wind_power_curve(V.ravel(), *CURVE_PARAMS[plant]).reshape(V.shape)
     return float(pred) if pred.shape == () else pred
 
 
@@ -108,12 +150,14 @@ def predict_gbm(velocity, direction, plant="Wind1"):
     return _predict_generic(GBM_MODEL, velocity, direction, plant)
 
 
-def predict(velocity, direction, plant="Wind1", model="gp"):
+def predict(velocity, direction=None, plant="Wind1", model="curve"):
     if plant not in ("Wind1", "Wind2"):
         raise ValueError(f"plant must be 'Wind1' or 'Wind2', got {plant!r}")
-    dispatch = {"gp": predict_gp, "gbm": predict_gbm}
+    dispatch = {"curve": predict_curve, "gp": predict_gp, "gbm": predict_gbm}
     if model not in dispatch:
         raise ValueError(f"model must be one of {list(dispatch)}, got {model!r}")
+    if model == "curve":
+        return predict_curve(velocity, plant=plant)
     return dispatch[model](velocity, direction, plant)
 
 
@@ -123,7 +167,7 @@ if __name__ == "__main__":
     sample_v, sample_dir = 10.0, 180.0
     print(f"Sample prediction at velocity={sample_v} m/s, direction={sample_dir} deg:")
     for plant in ["Wind1", "Wind2"]:
-        for model_name in ["gp", "gbm"]:
+        for model_name in ["curve", "gp", "gbm"]:
             pred = predict(sample_v, sample_dir, plant=plant, model=model_name)
             print(f"  plant={plant}, model={model_name}: {pred:.2f} MW")
 
@@ -132,10 +176,11 @@ if __name__ == "__main__":
     grids = {"Wind1": WIND1_GRID, "Wind2": WIND2_GRID}
     cap = max(CAPACITY_MW.values())
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
     for row, plant in enumerate(["Wind1", "Wind2"]):
         panels = [
             ("Actual", grids[plant]),
+            ("Curve", predict_curve(full_vel_mesh, plant=plant)),
             ("GP", predict_gp(full_vel_mesh, full_dir_mesh, plant=plant)),
             ("GBM", predict_gbm(full_vel_mesh, full_dir_mesh, plant=plant)),
         ]
